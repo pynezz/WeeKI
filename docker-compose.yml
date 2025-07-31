@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  weeki:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - WEEKI_HOST=0.0.0.0
+      - WEEKI_PORT=8000
+      - WEEKI_DEBUG=false
+      - WEEKI_DATABASE_URL=sqlite:///./data/weeki.db
+      - WEEKI_SECRET_KEY=${WEEKI_SECRET_KEY:-your-secret-key-change-me}
+      - WEEKI_LOG_LEVEL=INFO
+    volumes:
+      - weeki_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - weeki_network
+
+  # Optional: Add a reverse proxy for production deployments
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - weeki
+    restart: unless-stopped
+    networks:
+      - weeki_network
+    profiles:
+      - production
+
+volumes:
+  weeki_data:
+
+networks:
+  weeki_network:
+    driver: bridge
