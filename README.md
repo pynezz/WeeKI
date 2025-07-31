@@ -1,0 +1,2 @@
+# WeeKI
+Wee, Kunstig Intelligens.
