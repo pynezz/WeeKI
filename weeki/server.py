@@ -2,14 +2,16 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .config import settings
 from .agents import AgentOrchestrator
+from .database import db_manager
+from .monitoring import system_monitor
 
 
 # Request/Response models
@@ -25,6 +27,9 @@ class TaskResponse(BaseModel):
     status: str
     message: str
     result: Dict[str, Any] = {}
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    processing_time: Optional[float] = None
 
 
 class HealthResponse(BaseModel):
@@ -32,6 +37,23 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     agents_active: int
+
+
+class SystemStatusResponse(BaseModel):
+    """System status response model."""
+    timestamp: str
+    system: Dict[str, Any]
+    agents: Dict[str, Any]
+    tasks: Dict[str, Any]
+    metrics: Optional[Dict[str, Any]] = None
+
+
+class TaskListResponse(BaseModel):
+    """Task list response model."""
+    tasks: List[TaskResponse]
+    total: int
+    page: int
+    per_page: int
 
 
 # Global orchestrator instance
@@ -51,8 +73,17 @@ async def lifespan(app: FastAPI):
     logger = logging.getLogger(__name__)
     logger.info("Starting WeeKI agent orchestration system...")
     
+    # Initialize database
+    db_manager.initialize()
+    await db_manager.create_tables_async()
+    logger.info("Database initialized")
+    
+    # Initialize orchestrator
     orchestrator = AgentOrchestrator()
     await orchestrator.initialize()
+    
+    # Start monitoring
+    await system_monitor.start_monitoring(interval=60)
     
     yield
     
@@ -60,6 +91,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down WeeKI agent orchestration system...")
     if orchestrator:
         await orchestrator.shutdown()
+    await system_monitor.stop_monitoring()
+    await db_manager.close()
 
 
 # Create FastAPI app
@@ -95,6 +128,13 @@ async def health_check():
     )
 
 
+@app.get("/status", response_model=SystemStatusResponse)
+async def system_status():
+    """Get detailed system status."""
+    status = await system_monitor.get_system_status()
+    return SystemStatusResponse(**status)
+
+
 @app.post("/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest):
     """Create a new task for the agent orchestrator."""
@@ -127,12 +167,51 @@ async def get_task_status(task_id: str):
             task_id=task_id,
             status=task_status["status"],
             message=task_status.get("message", ""),
-            result=task_status.get("result", {})
+            result=task_status.get("result", {}),
+            created_at=task_status.get("created_at"),
+            completed_at=task_status.get("completed_at"),
+            processing_time=task_status.get("processing_time")
         )
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get task status: {str(e)}")
+
+
+@app.get("/tasks", response_model=TaskListResponse)
+async def list_tasks(
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(10, ge=1, le=100, description="Items per page"),
+    status: Optional[str] = Query(None, description="Filter by status")
+):
+    """List tasks with pagination."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    
+    try:
+        tasks_data = await orchestrator.list_tasks(page, per_page, status)
+        
+        tasks = [
+            TaskResponse(
+                task_id=task["id"],
+                status=task["status"],
+                message=task.get("message", ""),
+                result=task.get("result", {}),
+                created_at=task.get("created_at"),
+                completed_at=task.get("completed_at"),
+                processing_time=task.get("processing_time")
+            )
+            for task in tasks_data["tasks"]
+        ]
+        
+        return TaskListResponse(
+            tasks=tasks,
+            total=tasks_data["total"],
+            page=page,
+            per_page=per_page
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list tasks: {str(e)}")
 
 
 @app.get("/")
@@ -143,5 +222,6 @@ async def root():
         "description": "AI Agent Orchestration System",
         "version": settings.api_version,
         "docs_url": "/docs",
-        "health_url": "/health"
+        "health_url": "/health",
+        "status_url": "/status"
     }

@@ -6,6 +6,7 @@ import uuid
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
+from datetime import datetime
 
 
 class AgentType(Enum):
@@ -239,6 +240,24 @@ class AgentOrchestrator:
         self.tasks[task_id] = task
         self.logger.info(f"Created task {task_id}: {directive}")
         
+        # Store in database
+        try:
+            from .database import db_manager, Task as TaskModel
+            async with db_manager.get_async_session() as session:
+                db_task = TaskModel(
+                    id=task_id,
+                    directive=directive,
+                    context=context or {},
+                    status=task.status.value,
+                    message=task.message,
+                    result=task.result,
+                    created_at=datetime.fromtimestamp(task.created_at)
+                )
+                session.add(db_task)
+                await session.commit()
+        except Exception as e:
+            self.logger.error(f"Failed to save task to database: {e}")
+        
         # Process task asynchronously
         asyncio.create_task(self._process_task(task))
         
@@ -246,14 +265,110 @@ class AgentOrchestrator:
     
     async def _process_task(self, task: Task):
         """Internal method to process a task."""
+        start_time = asyncio.get_event_loop().time()
         try:
             processed_task = await self.orchestrator.process_task(task)
             self.tasks[task.id] = processed_task
+            
+            # Update database
+            await self._update_task_in_db(processed_task, start_time)
+            
         except Exception as e:
             self.logger.error(f"Error in task processing: {str(e)}")
             task.status = TaskStatus.FAILED
             task.message = f"Internal error: {str(e)}"
             task.completed_at = asyncio.get_event_loop().time()
+            
+            # Update database
+            await self._update_task_in_db(task, start_time)
+    
+    async def _update_task_in_db(self, task: Task, start_time: float):
+        """Update task in database."""
+        try:
+            from .database import db_manager, Task as TaskModel
+            from sqlalchemy import select
+            from datetime import datetime
+            
+            processing_time = None
+            if task.completed_at:
+                processing_time = task.completed_at - start_time
+            
+            async with db_manager.get_async_session() as session:
+                # Get existing task
+                result = await session.execute(
+                    select(TaskModel).where(TaskModel.id == task.id)
+                )
+                db_task = result.scalar_one_or_none()
+                
+                if db_task:
+                    db_task.status = task.status.value
+                    db_task.message = task.message
+                    db_task.result = task.result
+                    if task.completed_at:
+                        db_task.completed_at = datetime.fromtimestamp(task.completed_at)
+                    if processing_time:
+                        db_task.processing_time = processing_time
+                    
+                    await session.commit()
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to update task in database: {e}")
+    
+    async def list_tasks(self, page: int = 1, per_page: int = 10, status_filter: str = None) -> Dict[str, Any]:
+        """List tasks with pagination."""
+        try:
+            from .database import db_manager, Task as TaskModel
+            from sqlalchemy import select, func, desc
+            
+            async with db_manager.get_async_session() as session:
+                # Build query
+                query = select(TaskModel)
+                count_query = select(func.count(TaskModel.id))
+                
+                if status_filter:
+                    query = query.where(TaskModel.status == status_filter)
+                    count_query = count_query.where(TaskModel.status == status_filter)
+                
+                # Get total count
+                total = await session.scalar(count_query) or 0
+                
+                # Get paginated results
+                query = query.order_by(desc(TaskModel.created_at))
+                query = query.offset((page - 1) * per_page).limit(per_page)
+                
+                result = await session.execute(query)
+                tasks = result.scalars().all()
+                
+                task_list = []
+                for task in tasks:
+                    task_dict = {
+                        "id": task.id,
+                        "directive": task.directive,
+                        "context": task.context,
+                        "status": task.status,
+                        "message": task.message,
+                        "result": task.result,
+                        "created_at": task.created_at.isoformat() if task.created_at else None,
+                        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                        "processing_time": task.processing_time
+                    }
+                    task_list.append(task_dict)
+                
+                return {
+                    "tasks": task_list,
+                    "total": total,
+                    "page": page,
+                    "per_page": per_page
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to list tasks: {e}")
+            return {
+                "tasks": [],
+                "total": 0,
+                "page": page,
+                "per_page": per_page
+            }
     
     async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Get the status of a task."""
